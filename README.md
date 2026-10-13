@@ -56,6 +56,16 @@ Shell fallback: `./anything-recorder.sh`
 - Preview is X11-only for now and only for concrete monitor names (not “portal” or “screen”).
 - Stop sends SIGINT so both backends exit cleanly.
 
+## Next steps
+
+- [ ] Update `anything-recorder.sh` to detect and prefer `gpu-screen-recorder` the same way the GTK app does.
+- [ ] Improve Wayland preview (or document that preview is X11-only for now).
+- [ ] Better monitor listing on Wayland when gsr is not installed (portal-only is fine, but make the UI clearer).
+- [ ] Optional: hardware HDMI capture card path (`/dev/videoX` + matching audio source) for capturing the physical HDMI output.
+- [ ] Polish: remember last video/audio source, better error messages when gsr or ffmpeg fail, and a small level meter for audio.
+- [ ] Test on real Wayland (GNOME/KDE) with `gpu-screen-recorder` and confirm portal flow + audio monitor selection.
+- [ ] Package or AppImage / simple install instructions for non-developers.
+
 ## License
 
 MIT
