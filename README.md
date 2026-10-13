@@ -3,29 +3,35 @@
 Record anything you're watching (screen / HDMI output + matching audio).
 
 A simple Linux GTK 3 app in the same spirit as [headset-recorder](https://github.com/edelarey/headset-recorder).  
-It captures a monitor (what is going out over HDMI or being cast) plus a PipeWire/Pulse **monitor** source (system audio) and writes an MP4 via ffmpeg.
+It captures a monitor (what is going out over HDMI or being cast) plus a PipeWire/Pulse **monitor** source and writes an MP4.
 
-## Current scope (v0.1)
+## Backends
 
-- X11: full screen or specific monitor capture + audio monitor.
-- Small live preview of the selected monitor (X11 only for now).
-- Same simple interface style as headset-recorder: source pickers, save folder, name, Record/Stop, status.
-- Wayland: audio monitor works; video capture currently falls back to a note (portal / gpu-screen-recorder path planned).
+- **Preferred**: `gpu-screen-recorder` (X11 + Wayland, GPU encode, portal support).  
+  The app detects it automatically if it is on PATH.
+- **Fallback**: ffmpeg + x11grab (X11 only).
+
+## Current scope (v0.2)
+
+- Video sources: portal, entire screen, named monitors (via gsr or xrandr).
+- Audio: PipeWire/Pulse `.monitor` sources.
+- Small X11 still-frame preview for concrete monitor names.
+- Same simple interface as headset-recorder.
 
 ## Dependencies
 
 ```bash
 sudo apt install build-essential pkg-config libgtk-3-dev ffmpeg
+# optional but recommended for Wayland / better quality:
+# install gpu-screen-recorder (flatpak, AUR, or from source)
 ```
 
-`pactl` (PipeWire/Pulse) must be available. On X11, `xrandr` is used to list monitors.
+`pactl` must be available.
 
 ## Build
 
 ```bash
 ./build.sh
-# or
-make
 ./anything-recorder
 ```
 
@@ -37,17 +43,18 @@ make
 
 ## Usage
 
-1. Select a **video source** (monitor). On X11 a small preview appears below.
-2. Select an **audio monitor** source (what the speakers/HDMI are playing).
-3. Choose save folder and name the take.
-4. Record / Stop. Output is an MP4.
+1. Select a **video** source (portal / screen / monitor name).
+2. Select an **audio monitor** source.
+3. Set folder + name.
+4. Record / Stop → MP4.
 
-There is also a no-compiler fallback: `./anything-recorder.sh` (needs ffmpeg, pactl, optional zenity).
+Shell fallback: `./anything-recorder.sh`
 
 ## Notes
 
-- Preview is intentionally lightweight (periodic still frames) so it doesn't interfere with recording.
-- For best results on modern Wayland desktops, a future version will use the xdg-desktop-portal ScreenCast path (or wrap `gpu-screen-recorder`).
+- On Wayland, choose **Portal** (or a named monitor if gsr lists them). The portal dialog appears when recording starts.
+- Preview is X11-only for now and only for concrete monitor names (not “portal” or “screen”).
+- Stop sends SIGINT so both backends exit cleanly.
 
 ## License
 
