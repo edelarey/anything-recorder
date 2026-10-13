@@ -1,0 +1,23 @@
+#!/bin/bash
+# Launch Anything Recorder with a clean session environment.
+# A snap or IDE can inject GTK module paths that crash the app at startup.
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec env -i \
+  HOME="$HOME" \
+  USER="${USER:-}" \
+  LOGNAME="${LOGNAME:-${USER:-}}" \
+  LANG="${LANG:-C.UTF-8}" \
+  DISPLAY="${DISPLAY:-}" \
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+  XAUTHORITY="${XAUTHORITY:-}" \
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+  XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}" \
+  XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-}" \
+  XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-}" \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+  XDG_ACTIVATION_TOKEN="${XDG_ACTIVATION_TOKEN:-}" \
+  DESKTOP_STARTUP_ID="${DESKTOP_STARTUP_ID:-}" \
+  XDG_DATA_DIRS="/usr/share/ubuntu:/usr/share/gnome:/usr/local/share:/usr/share:/var/lib/snapd/desktop" \
+  PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin" \
+  /usr/bin/python3 "$DIR/anything_recorder.py" "$@"

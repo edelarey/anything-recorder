@@ -1,3 +1,7 @@
+/* Earlier C prototype. The app install.sh pins to the dock is
+ * anything_recorder.py — this machine has no GTK headers or compiler.
+ * Keep this file as the short C version of the same idea.
+ */
 #define _GNU_SOURCE
 #include <gtk/gtk.h>
 #include <pthread.h>

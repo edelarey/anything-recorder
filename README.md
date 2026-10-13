@@ -1,38 +1,63 @@
 # anything-recorder
 
-Record anything you're watching (screen / HDMI output + matching audio).
+Record anything you're watching.
 
-A simple Linux GTK 3 app in the same spirit as [headset-recorder](https://github.com/edelarey/headset-recorder).  
-It captures a monitor (what is going out over HDMI or being cast) plus a PipeWire/Pulse **monitor** source and writes an MP4.
+A Linux GTK 3 app in the same spirit as [headset-recorder](https://github.com/edelarey/headset-recorder). Pick a display and, separately, a PipeWire/Pulse **monitor** source, then write an MP4. The picture does not force the sound: a second screen can be the video while the laptop speakers, or an HDMI output, are the audio.
+
+## What you can record
+
+- **One display.** Every connected monitor is listed by name (for example `eDP-1`, `HDMI-1`). Plug another in and it appears in Display within a few seconds, or press Refresh.
+- **The whole desktop.** Every display in one frame.
+- **Portal.** The system dialog asks for a screen or a window when recording starts.
+- **A capture device.** Any `/dev/video*` node that can capture (webcam or HDMI capture card), with whichever audio monitor you select.
+
+Audio choices are the `.monitor` sources (Speakers, HDMI 1, HDMI 2, HDMI 3, and so on). A level meter follows the one you pick. Idle HDMI outputs stay in the list.
+
+## Controls
+
+- **Always on top** keeps the window above other windows. The choice is remembered.
+- **Minimise** shrinks the window to a small bar. The timer and Stop stay available.
+- **Restore** opens the full window again.
+- The title-bar minimise button hides the window to the dock. Click the Anything Recorder icon there to bring it back.
+
+The window is part of the picture if it sits on the display you are recording. Minimise it, or move it to another display.
+
+Last display, audio source, folder, and always-on-top choice are saved in `~/.config/anything-recorder/config.ini`. New takes are named `recording-YYYYMMDD-HHMMSS.mp4`. The first launch uses the primary display, the default sink's monitor, and `~/Videos`.
 
 ## Backends
 
-- **Preferred**: `gpu-screen-recorder` (X11 + Wayland, GPU encode, portal support).  
-  The app detects it automatically if it is on PATH.
-- **Fallback**: ffmpeg + x11grab (X11 only).
+The app picks the first one that can do the job:
 
-## Current scope (v0.2)
+1. **`gpu-screen-recorder`**, when it is on `PATH`.
+2. **GNOME screen cast** on Wayland (per display, no extra package). This is what Ubuntu GNOME uses here.
+3. **ffmpeg `x11grab`** on X11 only.
+4. **Portal**, for a screen or window chosen in the system dialog.
+5. **Video4Linux** for `/dev/video*` devices.
 
-- Video sources: portal, entire screen, named monitors (via gsr or xrandr).
-- Audio: PipeWire/Pulse `.monitor` sources.
-- Small X11 still-frame preview for concrete monitor names.
-- Same simple interface as headset-recorder.
+Preview is a still of the selected display or camera. Portal has no still; the system dialog is the picker. Stop finalises the MP4.
 
 ## Dependencies
 
 ```bash
-sudo apt install build-essential pkg-config libgtk-3-dev ffmpeg
-# optional but recommended for Wayland / better quality:
-# install gpu-screen-recorder (flatpak, AUR, or from source)
+sudo apt install python3-gi gir1.2-gtk-3.0 \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-libav gstreamer1.0-pulseaudio
 ```
 
-`pactl` must be available.
+`pactl` must be available. `ffmpeg` is used for the X11 fallback. Optional: `gpu-screen-recorder`, and `zenity` for the shell fallback.
 
-## Build
+No C compiler is required. `main.c` is an earlier prototype; the dock launches the Python app.
+
+## Run
 
 ```bash
-./build.sh
 ./anything-recorder
+```
+
+Shell fallback, with the same display list and the same separate audio choice:
+
+```bash
+./anything-recorder.sh
 ```
 
 ## Install (GNOME / Ubuntu dock)
@@ -41,30 +66,19 @@ sudo apt install build-essential pkg-config libgtk-3-dev ffmpeg
 ./install.sh
 ```
 
+Copies the app to `~/.local/bin`, adds a launcher, and pins **Anything Recorder** to the dock.
+
+```bash
+./install.sh --no-pin       # launcher only
+./install.sh --uninstall    # remove the launcher and unpin it
+```
+
 ## Usage
 
-1. Select a **video** source (portal / screen / monitor name).
-2. Select an **audio monitor** source.
-3. Set folder + name.
-4. Record / Stop → MP4.
-
-Shell fallback: `./anything-recorder.sh`
-
-## Notes
-
-- On Wayland, choose **Portal** (or a named monitor if gsr lists them). The portal dialog appears when recording starts.
-- Preview is X11-only for now and only for concrete monitor names (not “portal” or “screen”).
-- Stop sends SIGINT so both backends exit cleanly.
-
-## Next steps
-
-- [ ] Update `anything-recorder.sh` to detect and prefer `gpu-screen-recorder` the same way the GTK app does.
-- [ ] Improve Wayland preview (or document that preview is X11-only for now).
-- [ ] Better monitor listing on Wayland when gsr is not installed (portal-only is fine, but make the UI clearer).
-- [ ] Optional: hardware HDMI capture card path (`/dev/videoX` + matching audio source) for capturing the physical HDMI output.
-- [ ] Polish: remember last video/audio source, better error messages when gsr or ffmpeg fail, and a small level meter for audio.
-- [ ] Test on real Wayland (GNOME/KDE) with `gpu-screen-recorder` and confirm portal flow + audio monitor selection.
-- [ ] Package or AppImage / simple install instructions for non-developers.
+1. Select a **display** (or the whole desktop, portal, or a capture device).
+2. Select an **audio monitor**. It does not have to match the display.
+3. Set the folder and the name.
+4. Record / Stop. The file is an H.264 + AAC MP4.
 
 ## License
 
