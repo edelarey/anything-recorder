@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import cairo
@@ -400,6 +402,31 @@ class MutterSession:
 _MUTTER_OK: bool | None = None
 
 
+def pipewire_serial(node_id: int, timeout: float = 1.5) -> str:
+    """Return the object serial WirePlumber uses to link this node.
+
+    Mutter reports a node id. PipeWire recycles that id, and a numeric
+    target.object is matched as object.serial, not as the node id.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        serial = ""
+        try:
+            raw = subprocess.check_output(["pw-dump"], text=True, timeout=3)
+            for obj in json.loads(raw):
+                if obj.get("id") != int(node_id) or "Node" not in str(obj.get("type")):
+                    continue
+                serial = str((obj.get("info") or {}).get("props", {}).get("object.serial") or "")
+                break
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            serial = ""
+        if serial:
+            return serial
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.05)
+
+
 def mutter_available() -> bool:
     global _MUTTER_OK
     if _MUTTER_OK is not None:
@@ -569,7 +596,9 @@ class Engine:
         self.on_finished = None
         self.on_error = None
         self._closed = False
+        self._shutdown_started = False
         self._reader = None
+        self.path = ""
 
     def start(self, video_id: str, audio: str, path: str) -> None:
         if self.running:
@@ -580,6 +609,8 @@ class Engine:
             raise RuntimeError("Select a display.")
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         self._closed = False
+        self._shutdown_started = False
+        self.path = path
         self.running = False
         if video_id.startswith("v4l:"):
             self._start_pipeline(path, audio, v4l=video_id.split(":", 1)[1])
@@ -609,27 +640,35 @@ class Engine:
 
     def _start_mutter(self, video_id: str, audio: str, path: str) -> None:
         monitors = list_monitors()
-        session = MutterSession()
-        self.mutter = session
-        try:
-            if video_id == "desktop":
-                if not monitors:
-                    raise RuntimeError("No displays are connected.")
-                x, y, w, h = monitor_bounds(monitors)
-                session.open_area(x, y, w, h)
-                self.backend = "gnome-desktop"
-            else:
-                connector = video_id.split(":", 1)[1]
-                if monitors and not any(m["connector"] == connector for m in monitors):
-                    raise RuntimeError(f"{connector} is not connected. Refresh the display list.")
-                session.open_monitor(connector)
-                self.backend = "gnome"
-            node = session.wait_node()
-            self._start_pipeline(path, audio, node=node)
-        except Exception:
+        error = "The display did not deliver video."
+        for attempt in range(3):
+            session = MutterSession()
+            self.mutter = session
+            try:
+                if video_id == "desktop":
+                    if not monitors:
+                        raise RuntimeError("No displays are connected.")
+                    x, y, w, h = monitor_bounds(monitors)
+                    session.open_area(x, y, w, h)
+                    self.backend = "gnome-desktop"
+                else:
+                    connector = video_id.split(":", 1)[1]
+                    if monitors and not any(m["connector"] == connector for m in monitors):
+                        raise RuntimeError(f"{connector} is not connected. Refresh the display list.")
+                    session.open_monitor(connector)
+                    self.backend = "gnome"
+                node = session.wait_node()
+                self._start_pipeline(path, audio, node=node, watch=False)
+                error = self._video_flowing(1.2) or ""
+                if not error:
+                    self._arm_bus()
+                    return
+            except Exception as exc:
+                error = str(exc)
+            self._discard_pipe()
             session.close()
             self.mutter = None
-            raise
+        raise RuntimeError(error or "The display did not deliver video.")
 
     def _start_portal(self, audio: str, path: str) -> None:
         portal = PortalSession()
@@ -647,18 +686,28 @@ class Engine:
             self.portal = None
             raise
 
-    def _start_pipeline(self, path: str, audio: str, node: int | None = None, fd: int | None = None, v4l: str | None = None) -> None:
+    def _start_pipeline(self, path: str, audio: str, node: int | None = None, fd: int | None = None, v4l: str | None = None, watch: bool = True) -> None:
         if v4l:
-            video = "v4l2src name=vsrc do-timestamp=true ! videoconvert ! videorate"
+            # Cameras advertise a real frame rate. Locking that rate is fine.
+            video = (
+                "v4l2src name=vsrc do-timestamp=true ! videoconvert ! videorate ! "
+                "video/x-raw,format=I420,framerate=30/1"
+            )
         else:
-            video = "pipewiresrc name=vsrc do-timestamp=true client-name=anything-recorder ! videoconvert ! videorate"
+            # Screen casts advertise framerate 0/1. Forcing 30 fps with
+            # videorate waits forever for a second frame and Stop never returns.
+            video = (
+                "pipewiresrc name=vsrc do-timestamp=true client-name=anything-recorder ! "
+                "videoconvert ! video/x-raw,format=I420"
+            )
         desc = (
-            f"{video} ! video/x-raw,format=I420,framerate=30/1 ! "
+            f"{video} ! "
             "x264enc tune=zerolatency speed-preset=veryfast bitrate=12000 key-int-max=60 ! "
-            "video/x-h264,stream-format=avc,alignment=au ! queue ! mux. "
+            "video/x-h264,stream-format=avc,alignment=au ! "
+            "queue max-size-buffers=4 ! mux. "
             "pulsesrc name=asrc ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! "
             "avenc_aac bitrate=192000 ! aacparse ! queue ! mux. "
-            "mp4mux name=mux ! filesink name=sink"
+            "mp4mux name=mux fragment-duration=500 ! filesink name=sink sync=false async=false"
         )
         pipe = Gst.parse_launch(desc)
         pipe.get_by_name("asrc").set_property("device", audio)
@@ -666,17 +715,79 @@ class Engine:
         if v4l:
             pipe.get_by_name("vsrc").set_property("device", v4l)
         else:
-            pipe.get_by_name("vsrc").set_property("path", str(int(node)))
+            src = pipe.get_by_name("vsrc")
+            # Copy DMA-BUF frames so the encoder can hold them, and do not
+            # offer a PipeWire clock: the pipeline stays paused until a
+            # buffer arrives, and that clock never starts.
+            src.set_property("always-copy", True)
+            src.set_property("provide-clock", False)
             if fd is not None and fd >= 0:
-                pipe.get_by_name("vsrc").set_property("fd", int(fd))
-        bus = pipe.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_bus)
+                # The portal hands back a private PipeWire socket. On that
+                # socket the node id is the connect target.
+                src.set_property("fd", int(fd))
+                src.set_property("path", str(int(node)))
+            else:
+                serial = pipewire_serial(int(node))
+                if not serial:
+                    pipe.set_state(Gst.State.NULL)
+                    raise RuntimeError("The display capture stream was not ready. Try Record again.")
+                src.set_property("target-object", serial)
         ret = pipe.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             pipe.set_state(Gst.State.NULL)
             raise RuntimeError("Could not start the capture pipeline. Check the audio source.")
         self.pipe = pipe
+        if watch:
+            self._arm_bus()
+
+    def _arm_bus(self) -> None:
+        if self.pipe is None:
+            return
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus)
+
+    def _discard_pipe(self) -> None:
+        pipe = self.pipe
+        self.pipe = None
+        if pipe is not None:
+            pipe.set_state(Gst.State.NULL)
+        if self.path and os.path.isfile(self.path) and os.path.getsize(self.path) < 8192:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+    def _video_flowing(self, timeout: float) -> str | None:
+        """Wait until a video frame arrives. None means a frame arrived."""
+        if self.pipe is None:
+            return "Capture pipeline did not start."
+        src = self.pipe.get_by_name("vsrc")
+        if src is None:
+            return None
+        got = {"n": 0}
+
+        def on_buf(_pad, _info):
+            got["n"] += 1
+            return Gst.PadProbeReturn.OK
+
+        src.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, on_buf)
+        bus = self.pipe.get_bus()
+        deadline = time.monotonic() + timeout
+        context = GLib.MainContext.default()
+        while time.monotonic() < deadline:
+            msg = bus.pop_filtered(Gst.MessageType.ERROR)
+            if msg is not None:
+                return gst_error(msg)
+            # A single preroll frame is not enough: the cast sometimes
+            # negotiates and then never sends another frame.
+            if got["n"] >= 8:
+                return None
+            context.iteration(False)
+            time.sleep(0.02)
+        if got["n"] >= 8:
+            return None
+        return "The display did not deliver video."
 
     def _start_x11(self, video_id: str, audio: str, path: str) -> None:
         monitors = list_monitors()
@@ -725,7 +836,6 @@ class Engine:
             code = self.proc.wait() if self.proc else 1
             GLib.idle_add(self._spawn_done, code, err)
 
-        import threading
         self._reader = threading.Thread(target=reader, daemon=True)
         self._reader.start()
 
@@ -744,7 +854,7 @@ class Engine:
         return False
 
     def _on_bus(self, _bus, msg) -> None:
-        if self._closed or self.pipe is None:
+        if self._closed or self._shutdown_started or self.pipe is None:
             return
         if msg.type == Gst.MessageType.ERROR:
             self._finish(False, gst_error(msg))
@@ -752,11 +862,36 @@ class Engine:
             self._finish(True, "Saved.")
 
     def request_stop(self) -> None:
+        if self._closed:
+            return
         if self.pipe is not None:
-            self.pipe.send_event(Gst.Event.new_eos())
+            # send_event(EOS) blocks until every source returns. A display
+            # that is not delivering frames never returns, and the call was
+            # on the UI thread, so GNOME reported the window as not responding.
+            self._shutdown_async(True, "Saved.")
             return
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGINT)
+
+    def _shutdown_async(self, ok: bool, message: str) -> None:
+        if self._shutdown_started or self.pipe is None:
+            return
+        self._shutdown_started = True
+        pipe = self.pipe
+
+        def work() -> None:
+            try:
+                pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+
+            def deliver() -> bool:
+                self._finish(ok, message)
+                return False
+
+            GLib.idle_add(deliver)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _finish(self, ok: bool, message: str) -> None:
         if self._closed:
@@ -765,7 +900,7 @@ class Engine:
         self.running = False
         pipe = self.pipe
         self.pipe = None
-        if pipe is not None:
+        if pipe is not None and not self._shutdown_started:
             pipe.set_state(Gst.State.NULL)
         if self.mutter is not None:
             self.mutter.close()
@@ -773,6 +908,10 @@ class Engine:
         if self.portal is not None:
             self.portal.close()
             self.portal = None
+        size = os.path.getsize(self.path) if self.path and os.path.isfile(self.path) else 0
+        if ok and size < 8192:
+            ok = False
+            message = "The recording file is empty. The display did not deliver video."
         cb = self.on_finished if ok else self.on_error
         if cb:
             cb(message)
@@ -780,6 +919,9 @@ class Engine:
     def force_close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGINT)
+        if self.pipe is not None and not self._shutdown_started:
+            self._shutdown_async(False, "Stopped.")
+            return
         self._finish(False, "Stopped.")
 
 
@@ -804,11 +946,17 @@ def grab_still(video_id: str, dest: str) -> None:
             else:
                 session.open_monitor(video_id.split(":", 1)[1])
             node = session.wait_node()
+            serial = pipewire_serial(node)
+            if not serial:
+                raise RuntimeError("The display capture stream was not ready.")
             pipe = Gst.parse_launch(
                 "pipewiresrc name=src num-buffers=1 do-timestamp=true client-name=anything-preview ! "
                 "videoconvert ! pngenc ! filesink name=sink"
             )
-            pipe.get_by_name("src").set_property("path", str(node))
+            src = pipe.get_by_name("src")
+            src.set_property("target-object", serial)
+            src.set_property("always-copy", True)
+            src.set_property("provide-clock", False)
         else:
             raise RuntimeError("No still preview for this source.")
         pipe.get_by_name("sink").set_property("location", dest)
