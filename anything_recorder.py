@@ -25,6 +25,12 @@ import time
 import cairo
 import gi
 
+# Mutter on Wayland ignores Gtk's keep-above flag. An XWayland window
+# carries _NET_WM_STATE_ABOVE, which this compositor does honor. Set the
+# backend before Gdk opens a display. Capture itself uses PipeWire.
+if not os.environ.get("GDK_BACKEND") and os.environ.get("DISPLAY"):
+    os.environ["GDK_BACKEND"] = "x11"
+
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Gst", "1.0")
@@ -81,6 +87,188 @@ def save_config(values: dict[str, str]) -> None:
         cp.write(fh)
 
 
+def debug_log_path() -> str:
+    return os.path.join(GLib.get_user_config_dir(), "anything-recorder", "debug.log")
+
+
+_LOG_LOCK = threading.Lock()
+_GST_LOG_READY = False
+
+
+def log_event(event: str, **fields) -> None:
+    """Append one line to the capture debug log. Safe to call from any thread."""
+    parts = [time.strftime("%H:%M:%S"), event]
+    for key, value in fields.items():
+        text = str(value).replace("\n", " ")
+        if len(text) > 360:
+            text = text[:360] + "…"
+        parts.append(f"{key}={text}")
+    line = " ".join(parts) + "\n"
+    path = debug_log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _LOG_LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+    except OSError:
+        pass
+
+
+def _rotate_debug_log() -> None:
+    path = debug_log_path()
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 1_500_000:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
+def _pw_dump() -> list:
+    try:
+        raw = subprocess.check_output(["pw-dump"], text=True, timeout=3)
+        data = json.loads(raw)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        log_event("pw-dump-failed", err=exc)
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _fmt_param(value) -> str:
+    if not value:
+        return "-"
+    try:
+        text = json.dumps(value, separators=(",", ":"))
+    except TypeError:
+        text = str(value)
+    return text if len(text) <= 280 else text[:280] + "…"
+
+
+def log_pipewire_node(node_id: int, why: str) -> None:
+    """Log the node we are about to capture, and every other live video node.
+
+    A monitor can expose more than one stream. The one Mutter names is not
+    always the one that carries frames.
+    """
+    data = _pw_dump()
+    nodes = []
+    ports = []
+    for obj in data:
+        kind = str(obj.get("type"))
+        if kind.endswith("Node"):
+            nodes.append(obj)
+        elif kind.endswith("Port"):
+            ports.append(obj)
+    target = None
+    others = []
+    for obj in nodes:
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        media = str(props.get("media.class") or "")
+        name = str(props.get("node.name") or "")
+        interesting = (
+            obj.get("id") == int(node_id)
+            or "Video" in media
+            or "screen" in name.lower()
+            or "mutter" in name.lower()
+        )
+        if obj.get("id") == int(node_id):
+            target = obj
+        elif interesting:
+            others.append(obj)
+    if target is None:
+        log_event("pw-node-missing", why=why, node=node_id, nodes=len(nodes))
+        return
+    info = target.get("info") or {}
+    props = info.get("props") or {}
+    node_ports = []
+    for port in ports:
+        pinfo = port.get("info") or {}
+        pprops = pinfo.get("props") or {}
+        if int(pprops.get("node.id") or -1) != int(node_id):
+            continue
+        params = pinfo.get("params") or {}
+        node_ports.append(
+            f"{port.get('id')}:{pinfo.get('direction')}:{pprops.get('port.name')} "
+            f"fmt={_fmt_param(params.get('Format'))}"
+        )
+    log_event(
+        "pw-node",
+        why=why,
+        id=node_id,
+        serial=props.get("object.serial"),
+        name=props.get("node.name"),
+        media=props.get("media.name"),
+        klass=props.get("media.class"),
+        state=info.get("state"),
+        error=info.get("error") or "",
+        outs=info.get("n-output-ports"),
+        ports="; ".join(node_ports) or "none",
+    )
+    for obj in others[:8]:
+        oinfo = obj.get("info") or {}
+        oprops = oinfo.get("props") or {}
+        log_event(
+            "pw-other-video",
+            why=why,
+            id=obj.get("id"),
+            serial=oprops.get("object.serial"),
+            name=oprops.get("node.name"),
+            media=oprops.get("media.name"),
+            klass=oprops.get("media.class"),
+            state=oinfo.get("state"),
+        )
+
+
+def _install_gst_log() -> None:
+    global _GST_LOG_READY
+    if _GST_LOG_READY:
+        return
+    _GST_LOG_READY = True
+    try:
+        Gst.debug_set_active(True)
+        Gst.debug_set_colored(False)
+        # WARNING keeps the app quiet. DEBUG dumps every caps negotiation
+        # to the terminal, which hid the useful lines.
+        Gst.debug_set_threshold_for_name("pipewiresrc", Gst.DebugLevel.WARNING)
+    except Exception as exc:
+        log_event("gst-debug-setup-failed", err=exc)
+        return
+
+    def on_log(_cat, level, _file, _func, _line, _obj, message, _data) -> None:
+        try:
+            text = str(message)
+        except Exception:
+            return
+        low = text.lower()
+        if not any(word in low for word in ("connect", "target", "error", "stream", "format", "negot", "caps", "fail", "buffer")):
+            return
+        log_event("gst", lvl=int(level), msg=text)
+
+    try:
+        Gst.debug_add_log_function(on_log, None)
+    except Exception as exc:
+        log_event("gst-log-fn-failed", err=exc)
+
+
+def _buffer_sample(buf) -> str:
+    try:
+        ok, mapped = buf.map(Gst.MapFlags.READ)
+    except Exception as exc:
+        return f"map-error {exc}"
+    if not ok:
+        return "unmapable"
+    try:
+        data = bytes(mapped.data)
+    finally:
+        buf.unmap(mapped)
+    if not data:
+        return "empty"
+    step = max(1, len(data) // 64)
+    sample = data[0:len(data):step][:64]
+    mean = sum(sample) / len(sample)
+    return f"bytes={len(data)} luma~{mean:.1f} head={data[:8].hex()}"
+
+
 def parse_xrandr_monitors(text: str) -> list[dict]:
     found = []
     for line in text.splitlines():
@@ -131,6 +319,104 @@ def monitor_bounds(monitors: list[dict]) -> tuple[int, int, int, int]:
     x1 = max(m["x"] + m["w"] for m in monitors)
     y1 = max(m["y"] + m["h"] for m in monitors)
     return x0, y0, x1 - x0, y1 - y0
+
+
+def damage_origin(video_id: str) -> tuple[int, int] | None:
+    """Top-left of the monitor or desktop being captured, in X11 pixels."""
+    monitors = list_monitors()
+    if video_id == "desktop":
+        if not monitors:
+            return None
+        x, y, _w, _h = monitor_bounds(monitors)
+        return x, y
+    if not video_id.startswith("monitor:"):
+        return None
+    connector = video_id.split(":", 1)[1]
+    match = next((m for m in monitors if m["connector"] == connector), None)
+    if match is None:
+        return None
+    return int(match["x"]), int(match["y"])
+
+
+def _clicks_pass_through(win: Gtk.Window) -> None:
+    """Empty the X11 input shape so the corner window does not take clicks."""
+    gdkwin = win.get_window()
+    if gdkwin is None or not hasattr(gdkwin, "get_xid"):
+        return
+    try:
+        gi.require_version("GdkX11", "3.0")
+        from gi.repository import GdkX11
+        import ctypes
+
+        xdisplay = GdkX11.X11Display.get_xdisplay(gdkwin.get_display())
+        xid = int(gdkwin.get_xid())
+        address = int(xdisplay) if not isinstance(xdisplay, int) else xdisplay
+        xext = ctypes.CDLL("libXext.so.6")
+        xext.XShapeCombineRectangles.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+        ]
+        # ShapeInput = 2, ShapeSet = 0, zero rectangles: no clickable area.
+        xext.XShapeCombineRectangles(
+            ctypes.c_void_p(address), ctypes.c_ulong(xid), 2,
+            0, 0, None, 0, 0, 0,
+        )
+    except Exception:
+        pass
+
+
+def open_damage_window(x: int, y: int) -> Gtk.Window | None:
+    """Map a clear always-on-top window so Mutter composites this monitor.
+
+    A hardware video plane, or a picture that is not being redrawn, never
+    damages the stage. Mutter then pushes no PipeWire buffers, the link
+    stays active, and the recording file stays empty. An XWayland window
+    on that output forces a composite for as long as the capture runs.
+    """
+    try:
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        win.set_decorated(False)
+        win.set_accept_focus(False)
+        win.set_focus_on_map(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_keep_above(True)
+        # A fully clear window is culled and does not damage the output.
+        # A small, faint square is enough for Mutter to composite the monitor.
+        win.set_opacity(0.15)
+        win.set_default_size(8, 8)
+        win.move(int(x), int(y))
+        win.show_all()
+        gdkwin = win.get_window()
+        if gdkwin is not None:
+            gdkwin.set_keep_above(True)
+        _clicks_pass_through(win)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            display.sync()
+        # show_all is not painted until the GTK loop runs. Preview waits on
+        # the pipeline bus, so paint once here before capture starts.
+        context = GLib.MainContext.default()
+        paint_until = time.monotonic() + 0.12
+        while time.monotonic() < paint_until:
+            while context.pending():
+                context.iteration(False)
+            time.sleep(0.01)
+        log_event("damage-window", x=int(x), y=int(y))
+        return win
+    except Exception as exc:
+        log_event("damage-window-failed", err=exc)
+        return None
+
+
+def close_damage_window(win: Gtk.Window | None) -> None:
+    if win is None:
+        return
+    try:
+        win.destroy()
+    except Exception as exc:
+        log_event("damage-window-close-failed", err=exc)
 
 
 def friendly_audio(name: str) -> str:
@@ -339,6 +625,8 @@ class MutterSession:
 
     def _on_added(self, _conn, _sender, _path, _iface, _signal, params, _data) -> None:
         self.node = int(params.unpack()[0])
+        log_event("mutter-node", stream=self.stream_path, node=self.node)
+        log_pipewire_node(self.node, "stream-added")
         if self._loop is not None and self._loop.is_running():
             self._loop.quit()
 
@@ -356,6 +644,7 @@ class MutterSession:
             8000,
             None,
         ).unpack()[0]
+        log_event("mutter-open", kind="monitor", connector=connector, stream=self.stream_path)
         self._start_stream()
 
     def open_area(self, x: int, y: int, width: int, height: int) -> None:
@@ -368,6 +657,7 @@ class MutterSession:
             8000,
             None,
         ).unpack()[0]
+        log_event("mutter-open", kind="area", x=x, y=y, w=width, h=height, stream=self.stream_path)
         self._start_stream()
 
     def wait_node(self, timeout: float = 4.0) -> int:
@@ -421,10 +711,155 @@ def pipewire_serial(node_id: int, timeout: float = 1.5) -> str:
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
             serial = ""
         if serial:
+            log_event("pw-serial", node=node_id, serial=serial)
             return serial
         if time.monotonic() >= deadline:
+            log_event("pw-serial-missing", node=node_id)
             return ""
         time.sleep(0.05)
+
+
+def _capture_client(prefix: str) -> str:
+    """Unique pipewiresrc node name so a leftover stream is not linked."""
+    return f"{prefix}{os.getpid()}-{time.time_ns() % 1_000_000_000}"
+
+
+def _screencast_ports(node_id: int, client_name: str) -> tuple[int | None, int | None]:
+    """Return the Mutter output port id and the pipewiresrc input port id."""
+    consumers: list[int] = []
+    ports = []
+    for obj in _pw_dump():
+        kind = str(obj.get("type") or "")
+        if kind.endswith("Node"):
+            props = (obj.get("info") or {}).get("props") or {}
+            if str(props.get("node.name") or "") == client_name:
+                try:
+                    consumers.append(int(obj["id"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+        elif kind.endswith("Port"):
+            ports.append(obj)
+    consumer = max(consumers) if consumers else None
+    out_id = None
+    in_id = None
+    for obj in ports:
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        try:
+            owner = int(props.get("node.id"))
+            pid = int(obj["id"])
+        except (TypeError, ValueError):
+            continue
+        direction = str(info.get("direction") or "").lower()
+        if owner == int(node_id) and direction == "output" and out_id is None:
+            out_id = pid
+        if consumer is not None and owner == consumer and direction == "input" and in_id is None:
+            in_id = pid
+    return out_id, in_id
+
+
+def link_screencast(node_id: int, client_name: str, timeout: float = 2.0) -> None:
+    """Connect the Mutter output to pipewiresrc with pw-link.
+
+    target-object matches object.serial. On this PipeWire that lookup often
+    fails with "stream error: target not found", and the pipeline then sits
+    in PLAYING with zero buffers. Linking the two port ids delivers frames.
+    "File exists" means the ports are already connected.
+    """
+    deadline = time.monotonic() + timeout
+    last = "The display capture ports were not ready."
+    last_log = 0.0
+    while True:
+        out_id, in_id = _screencast_ports(node_id, client_name)
+        if out_id is not None and in_id is not None:
+            try:
+                proc = subprocess.run(
+                    ["pw-link", str(out_id), str(in_id)],
+                    text=True,
+                    capture_output=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                last = str(exc)
+                log_event("pw-link", node=node_id, client=client_name, out=out_id, inp=in_id, err=exc)
+            else:
+                err = ((proc.stderr or "") + " " + (proc.stdout or "")).strip()
+                log_event(
+                    "pw-link",
+                    node=node_id,
+                    client=client_name,
+                    out=out_id,
+                    inp=in_id,
+                    code=proc.returncode,
+                    err=err,
+                )
+                if proc.returncode == 0 or "file exists" in err.lower():
+                    return
+                last = err or f"pw-link exited {proc.returncode}"
+        else:
+            now = time.monotonic()
+            if now - last_log > 0.4:
+                log_event(
+                    "pw-link-wait",
+                    node=node_id,
+                    client=client_name,
+                    out="" if out_id is None else out_id,
+                    inp="" if in_id is None else in_id,
+                )
+                last_log = now
+        if time.monotonic() >= deadline:
+            log_event("pw-link-failed", node=node_id, client=client_name, err=last)
+            raise RuntimeError(last)
+        time.sleep(0.05)
+
+
+def play_and_link(pipe, node_id: int, client_name: str, timeout: float = 2.0, fail_message: str = "Could not start the capture pipeline.") -> None:
+    """Start the pipeline and link video on another thread.
+
+    A video-only pipeline blocks inside set_state(PLAYING) until the first
+    frame. The link has to be made from a second thread, or that wait never
+    ends. If the state change is still blocked after the link attempt, it
+    is aborted so the window does not stay frozen.
+    """
+    box: dict = {"error": None, "done": threading.Event()}
+
+    def do_link() -> None:
+        try:
+            link_screencast(node_id, client_name, timeout=timeout)
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            box["done"].set()
+
+    state_done = threading.Event()
+
+    def abort() -> None:
+        if state_done.wait(timeout + 1.5):
+            return
+        log_event("pipe-state-abort", node=node_id, client=client_name)
+        try:
+            pipe.set_state(Gst.State.NULL)
+        except Exception as exc:
+            log_event("pipe-state-abort-failed", err=exc)
+
+    threading.Thread(target=do_link, daemon=True).start()
+    threading.Thread(target=abort, daemon=True).start()
+    try:
+        ret = pipe.set_state(Gst.State.PLAYING)
+    finally:
+        state_done.set()
+    log_event("pipe-playing", ret=ret.value_nick if hasattr(ret, "value_nick") else str(ret), client=client_name)
+    if not box["done"].wait(0.3):
+        box["done"].wait(timeout)
+    if box["error"] is not None:
+        pipe.set_state(Gst.State.NULL)
+        raise box["error"]
+    if not box["done"].is_set():
+        pipe.set_state(Gst.State.NULL)
+        raise RuntimeError("The display capture stream did not link in time.")
+    if ret == Gst.StateChangeReturn.FAILURE:
+        pipe.set_state(Gst.State.NULL)
+        raise RuntimeError(fail_message)
 
 
 def mutter_available() -> bool:
@@ -591,6 +1026,7 @@ class Engine:
         self.proc = None
         self.mutter = None
         self.portal = None
+        self._damage = None
         self.running = False
         self.backend = ""
         self.on_finished = None
@@ -612,6 +1048,17 @@ class Engine:
         self._shutdown_started = False
         self.path = path
         self.running = False
+        _rotate_debug_log()
+        _install_gst_log()
+        log_event(
+            "record-start",
+            video=video_id,
+            audio=audio,
+            path=path,
+            monitors="; ".join(
+                f"{m['connector']} {m['w']}x{m['h']}+{m['x']}+{m['y']}" for m in list_monitors()
+            ),
+        )
         if video_id.startswith("v4l:"):
             self._start_pipeline(path, audio, v4l=video_id.split(":", 1)[1])
             self.backend = "camera"
@@ -638,9 +1085,24 @@ class Engine:
         if not self._closed:
             self.running = True
 
+    def _close_damage(self) -> None:
+        win = self._damage
+        self._damage = None
+        close_damage_window(win)
+
     def _start_mutter(self, video_id: str, audio: str, path: str) -> None:
         monitors = list_monitors()
+        origin = damage_origin(video_id)
+        if origin is not None:
+            self._damage = open_damage_window(*origin)
         error = "The display did not deliver video."
+        try:
+            self._mutter_attempts(video_id, audio, path, monitors, error)
+        except Exception:
+            self._close_damage()
+            raise
+
+    def _mutter_attempts(self, video_id: str, audio: str, path: str, monitors: list, error: str) -> None:
         for attempt in range(3):
             session = MutterSession()
             self.mutter = session
@@ -659,12 +1121,17 @@ class Engine:
                     self.backend = "gnome"
                 node = session.wait_node()
                 self._start_pipeline(path, audio, node=node, watch=False)
-                error = self._video_flowing(1.2) or ""
+                # The cast often sends its first frame late, after Mutter
+                # has inhibited the hardware cursor and repainted. One real
+                # frame means the link is up; later frames follow damage.
+                error = self._video_flowing(2.5) or ""
+                log_event("mutter-attempt", n=attempt + 1, video=video_id, node=node, error=error or "frames")
                 if not error:
                     self._arm_bus()
                     return
             except Exception as exc:
                 error = str(exc)
+                log_event("mutter-attempt-failed", n=attempt + 1, video=video_id, error=exc)
             self._discard_pipe()
             session.close()
             self.mutter = None
@@ -697,7 +1164,7 @@ class Engine:
             # Screen casts advertise framerate 0/1. Forcing 30 fps with
             # videorate waits forever for a second frame and Stop never returns.
             video = (
-                "pipewiresrc name=vsrc do-timestamp=true client-name=anything-recorder ! "
+                "pipewiresrc name=vsrc do-timestamp=true ! "
                 "videoconvert ! video/x-raw,format=I420"
             )
         desc = (
@@ -712,6 +1179,7 @@ class Engine:
         pipe = Gst.parse_launch(desc)
         pipe.get_by_name("asrc").set_property("device", audio)
         pipe.get_by_name("sink").set_property("location", path)
+        link_client = ""
         if v4l:
             pipe.get_by_name("vsrc").set_property("device", v4l)
         else:
@@ -721,22 +1189,70 @@ class Engine:
             # buffer arrives, and that clock never starts.
             src.set_property("always-copy", True)
             src.set_property("provide-clock", False)
+            # Mutter pushes a buffer only when that monitor is repainted.
+            # A still picture, or a video plane that does not damage the
+            # stage, would leave the muxer holding one frame and the file
+            # empty. Repeat the newest frame until the next real one.
+            src.set_property("keepalive-time", 200)
             if fd is not None and fd >= 0:
                 # The portal hands back a private PipeWire socket. On that
                 # socket the node id is the connect target.
                 src.set_property("fd", int(fd))
                 src.set_property("path", str(int(node)))
+                log_event("pipe-target", mode="portal-fd", node=node, fd=fd, path_prop=str(int(node)))
             else:
-                serial = pipewire_serial(int(node))
-                if not serial:
-                    pipe.set_state(Gst.State.NULL)
-                    raise RuntimeError("The display capture stream was not ready. Try Record again.")
-                src.set_property("target-object", serial)
-        ret = pipe.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            pipe.set_state(Gst.State.NULL)
-            raise RuntimeError("Could not start the capture pipeline. Check the audio source.")
+                link_client = _capture_client("ar")
+                src.set_property("client-name", link_client)
+                src.set_property("autoconnect", False)
+                log_event(
+                    "pipe-target",
+                    mode="pw-link",
+                    node=node,
+                    client=link_client,
+                    readback=src.get_property("client-name"),
+                )
+                log_pipewire_node(int(node), "before-playing")
+        # Count frames from the first buffer. Installing the probe after
+        # PLAYING misses the preroll, and a quiet display then looks dead.
+        self._frames = {"n": 0}
+        if not v4l:
+            def on_buf(pad, info):
+                buf = info.get_buffer()
+                n = self._frames["n"]
+                self._frames["n"] = n + 1
+                if n == 0 and buf is not None:
+                    caps = pad.get_current_caps()
+                    log_event(
+                        "first-buffer",
+                        pts=buf.pts,
+                        size=buf.get_size(),
+                        caps=caps.to_string() if caps is not None else "",
+                        sample=_buffer_sample(buf),
+                    )
+                return Gst.PadProbeReturn.OK
+
+            pipe.get_by_name("vsrc").get_static_pad("src").add_probe(
+                Gst.PadProbeType.BUFFER, on_buf
+            )
         self.pipe = pipe
+        try:
+            if link_client:
+                play_and_link(
+                    pipe,
+                    int(node),
+                    link_client,
+                    timeout=2.0,
+                    fail_message="Could not start the capture pipeline. Check the audio source.",
+                )
+            else:
+                ret = pipe.set_state(Gst.State.PLAYING)
+                log_event("pipe-playing", ret=ret.value_nick if hasattr(ret, "value_nick") else str(ret))
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("Could not start the capture pipeline. Check the audio source.")
+        except Exception:
+            self.pipe = None
+            pipe.set_state(Gst.State.NULL)
+            raise
         if watch:
             self._arm_bus()
 
@@ -759,33 +1275,32 @@ class Engine:
                 pass
 
     def _video_flowing(self, timeout: float) -> str | None:
-        """Wait until a video frame arrives. None means a frame arrived."""
+        """Wait until one video frame arrives. None means a frame arrived.
+
+        Mutter sends frames when the monitor is repainted. A hardware video
+        plane, or a display that is sitting still, can take more than a
+        second to deliver the first one, then continue. Requiring several
+        frames inside a short window rejected those streams.
+        """
         if self.pipe is None:
             return "Capture pipeline did not start."
-        src = self.pipe.get_by_name("vsrc")
-        if src is None:
-            return None
-        got = {"n": 0}
-
-        def on_buf(_pad, _info):
-            got["n"] += 1
-            return Gst.PadProbeReturn.OK
-
-        src.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, on_buf)
+        got = self._frames
         bus = self.pipe.get_bus()
         deadline = time.monotonic() + timeout
         context = GLib.MainContext.default()
         while time.monotonic() < deadline:
             msg = bus.pop_filtered(Gst.MessageType.ERROR)
             if msg is not None:
-                return gst_error(msg)
-            # A single preroll frame is not enough: the cast sometimes
-            # negotiates and then never sends another frame.
-            if got["n"] >= 8:
+                text = gst_error(msg)
+                log_event("video-error", buffers=got["n"], msg=text)
+                return text
+            if got["n"] >= 1:
+                log_event("video-flowing", buffers=got["n"])
                 return None
             context.iteration(False)
             time.sleep(0.02)
-        if got["n"] >= 8:
+        log_event("video-stalled", buffers=got["n"], waited=timeout)
+        if got["n"] >= 1:
             return None
         return "The display did not deliver video."
 
@@ -881,6 +1396,25 @@ class Engine:
 
         def work() -> None:
             try:
+                # EOS on the source pads flushes the muxer. Sending it to
+                # the pipeline instead waits on the live sources and the
+                # Stop button never returns.
+                for name in ("vsrc", "asrc"):
+                    element = pipe.get_by_name(name)
+                    if element is None:
+                        continue
+                    pad = element.get_static_pad("src")
+                    if pad is not None:
+                        pad.push_event(Gst.Event.new_eos())
+                bus = pipe.get_bus()
+                if bus is not None:
+                    bus.timed_pop_filtered(
+                        2 * Gst.SECOND,
+                        Gst.MessageType.EOS | Gst.MessageType.ERROR,
+                    )
+            except Exception:
+                pass
+            try:
                 pipe.set_state(Gst.State.NULL)
             except Exception:
                 pass
@@ -908,7 +1442,9 @@ class Engine:
         if self.portal is not None:
             self.portal.close()
             self.portal = None
+        self._close_damage()
         size = os.path.getsize(self.path) if self.path and os.path.isfile(self.path) else 0
+        log_event("record-finish", ok=ok, bytes=size, message=message, backend=self.backend)
         if ok and size < 8192:
             ok = False
             message = "The recording file is empty. The display did not deliver video."
@@ -929,6 +1465,10 @@ def grab_still(video_id: str, dest: str) -> None:
     """Write one preview frame for a monitor, the whole desktop, or a camera."""
     session = None
     pipe = None
+    damage = None
+    origin = damage_origin(video_id)
+    if origin is not None:
+        damage = open_damage_window(*origin)
     try:
         if video_id.startswith("v4l:"):
             pipe = Gst.parse_launch(
@@ -946,30 +1486,46 @@ def grab_still(video_id: str, dest: str) -> None:
             else:
                 session.open_monitor(video_id.split(":", 1)[1])
             node = session.wait_node()
-            serial = pipewire_serial(node)
-            if not serial:
-                raise RuntimeError("The display capture stream was not ready.")
+            client = _capture_client("ap")
             pipe = Gst.parse_launch(
-                "pipewiresrc name=src num-buffers=1 do-timestamp=true client-name=anything-preview ! "
+                "pipewiresrc name=src num-buffers=1 do-timestamp=true ! "
                 "videoconvert ! pngenc ! filesink name=sink"
             )
             src = pipe.get_by_name("src")
-            src.set_property("target-object", serial)
+            src.set_property("client-name", client)
+            src.set_property("autoconnect", False)
             src.set_property("always-copy", True)
             src.set_property("provide-clock", False)
+            # Same as recording: a monitor that is not being repainted
+            # never pushes the single preview buffer on its own.
+            src.set_property("keepalive-time", 200)
+            log_event("preview-link", node=node, client=client)
         else:
             raise RuntimeError("No still preview for this source.")
         pipe.get_by_name("sink").set_property("location", dest)
-        if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+        if video_id == "desktop" or video_id.startswith("monitor:"):
+            play_and_link(pipe, node, client, timeout=4.0, fail_message="Preview pipeline failed to start.")
+        elif pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("Preview pipeline failed to start.")
-        msg = pipe.get_bus().timed_pop_filtered(
-            5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR
-        )
+        # Poll the bus so the damage window can paint. A blocking pop
+        # freezes GTK and Mutter never composites the monitor.
+        bus = pipe.get_bus()
+        context = GLib.MainContext.default()
+        deadline = time.monotonic() + 5
+        msg = None
+        while time.monotonic() < deadline:
+            msg = bus.pop_filtered(Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            if msg is not None:
+                break
+            while context.pending():
+                context.iteration(False)
+            time.sleep(0.02)
         if msg is None:
             raise RuntimeError("Preview timed out.")
         if msg.type == Gst.MessageType.ERROR:
             raise RuntimeError(gst_error(msg))
     finally:
+        close_damage_window(damage)
         if pipe is not None:
             pipe.set_state(Gst.State.NULL)
         if session is not None:
@@ -1155,6 +1711,8 @@ class RecorderWindow:
         self.update_hint()
 
         self.top_switch.connect("notify::active", self._on_top_toggled)
+        self.window.connect("realize", lambda *_: self._apply_top())
+        self.window.connect("map", lambda *_: self._apply_top())
         self.min_btn.connect("clicked", lambda *_: self.minimise())
         self.restore_btn.connect("clicked", lambda *_: self.restore())
         video_refresh.connect("clicked", lambda *_: self.reload_video())
@@ -1185,7 +1743,13 @@ class RecorderWindow:
         self.top_switch.set_active(top not in ("0", "false", "no", "off"))
 
     def _apply_top(self) -> None:
-        self.window.set_keep_above(self.top_switch.get_active())
+        # Before the Gdk window exists this is a no-op, so realize and map
+        # call it again. On XWayland that sets _NET_WM_STATE_ABOVE.
+        above = self.top_switch.get_active()
+        self.window.set_keep_above(above)
+        gdk_window = self.window.get_window()
+        if gdk_window is not None:
+            gdk_window.set_keep_above(above)
 
     def _on_top_toggled(self, *_args) -> None:
         self._apply_top()
@@ -1369,6 +1933,7 @@ class RecorderWindow:
         self.min_btn.set_sensitive(False)
         self.restore_btn.set_sensitive(True)
         self.window.present()
+        self._apply_top()
 
     def restore(self) -> None:
         self.compact = False
@@ -1379,10 +1944,12 @@ class RecorderWindow:
         self.window.present()
         self.min_btn.set_sensitive(True)
         self.restore_btn.set_sensitive(False)
+        self._apply_top()
 
     def present(self) -> None:
         self.window.deiconify()
         self.window.present()
+        self._apply_top()
 
     def output_path(self) -> str:
         folder = self.folder_btn.get_filename() or ""
@@ -1592,6 +2159,7 @@ class RecorderApp(Gtk.Application):
             return
         self.ui = RecorderWindow(self, live=True)
         self.ui.window.show_all()
+        self.ui._apply_top()
         self.ui.set_status(self.ui._ready_text())
 
 

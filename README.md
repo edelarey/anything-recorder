@@ -22,6 +22,8 @@ Audio choices are the `.monitor` sources (Speakers, HDMI 1, HDMI 2, HDMI 3, and 
 
 The window is part of the picture if it sits on the display you are recording. Minimise it, or move it to another display.
 
+A small faint square stays in the top-left corner of the display being previewed or recorded. Clicks pass through it. GNOME only sends frames for a monitor it is drawing itself, and a video playing straight to that screen does not count. The square makes GNOME draw the monitor, so the video is in the recording.
+
 Last display, audio source, folder, and always-on-top choice are saved in `~/.config/anything-recorder/config.ini`. New takes are named `recording-YYYYMMDD-HHMMSS.mp4`. The first launch uses the primary display, the default sink's monitor, and `~/Videos`.
 
 ## Backends
@@ -79,6 +81,16 @@ Copies the app to `~/.local/bin`, adds a launcher, and pins **Anything Recorder*
 2. Select an **audio monitor**. It does not have to match the display.
 3. Set the folder and the name.
 4. Record / Stop. The file is an H.264 + AAC MP4.
+
+## Handoff (2026-10-13)
+
+Fixed and checked on the installed file, `monitor:DP-7`, while video was playing on that display. Preview wrote a 1920x1080 PNG in about half a second. A three-second record returned `Saved.` and `ffprobe` showed H.264 1920x1080 plus AAC 48 kHz stereo. The test PNG and MP4 were deleted.
+
+The link was not the failure. `pw-link` from the Mutter output to the `pipewiresrc` input goes active and negotiates BGRA 1920x1080, then GStreamer often gets zero buffers. Mutter only pushes a frame when it composites that monitor. Full-screen video on DP-7 is scanned out by the GPU, so the cast sits at zero frames. The laptop panel worked because it was being redrawn. FFmpeg `x11grab` is black on this Wayland session, and this FFmpeg build has no PipeWire capture device. `kmsgrab` needs privileges the app does not have.
+
+The fix is a 8×8 XWayland popup at 15% opacity, always on top, input shape empty, kept up for the whole preview or record. A fully transparent window is culled and does not help. Do not set `target-object`. Do not send EOS to the whole pipeline. Copy `anything_recorder.py` to `~/.local/bin/anything-recorder.py` after every edit and `cmp` them.
+
+The dock runs `~/.local/bin/anything-recorder.py`, not this directory. The wrapper `env -i`s and keeps the system `XDG_DATA_DIRS`. Leave `always_on_top=false` in the saved config. Do not restart gnome-shell or PipeWire. Shell tests need `python3 -u` and that same `env -i`. Screen casts advertise `framerate=0/1`; do not force 30 fps with `videorate`, or Stop hangs.
 
 ## License
 
